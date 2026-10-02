@@ -95,7 +95,7 @@
                 </Scripts>
             </Button>
 
-            <DressUpModel name="$parentItemModel" scale="4.0">
+            <DressUpModel name="$parentItemModel">
                 <Size>
                     <AbsDimension x="80" y="107"/>
                 </Size>
@@ -917,7 +917,7 @@
                 </Scripts>
             </Button>
 
-            <DressUpModel name="$parentPlayerModel" scale="2.0" enableMouse="true">
+            <DressUpModel name="$parentPlayerModel" enableMouse="true">
                 <Size>
                     <AbsDimension x="221" y="362"/>
                 </Size>

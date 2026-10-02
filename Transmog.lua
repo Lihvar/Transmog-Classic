@@ -51,6 +51,7 @@ Transmog.scanTip = CreateFrame("GameTooltip", "TransmogScanTooltip", UIParent, "
 Transmog.debug = false
 
 Transmog:RegisterEvent("PLAYER_LOGIN")
+Transmog:RegisterEvent("PLAYER_ENTERING_WORLD")
 Transmog:RegisterEvent("GOSSIP_SHOW")
 Transmog:RegisterEvent("GOSSIP_CLOSED")
 Transmog:RegisterEvent("UNIT_INVENTORY_CHANGED")
@@ -353,6 +354,15 @@ end
 Transmog:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
 
     if event then
+        if event == "PLAYER_ENTERING_WORLD" then
+            if not Transmog.worldLoadDone then
+                Transmog.worldLoadDone = true
+                C_Timer.After(3, function()
+                    Transmog:LoadOnce()
+                end)
+            end
+            return
+        end
         if event == "PLAYER_LOGIN" then
             -- saved variables are available now
             Transmog:CacheOutfitsItems()
@@ -407,7 +417,23 @@ Transmog:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
             -- NOTE: the original "TW_CHAT_MSG_WHISPER" inspect-whisper handler was removed.
             -- Its prefix is longer than the 16 characters that 1.14 allows for addon messages.
 
+			if not (arg1 and TransmogFrame_Find(arg1, Transmog.prefix, 1, true)) then
+				Transmog.stats.addonOther = Transmog.stats.addonOther + 1
+				Transmog.otherPrefixes[tostring(arg1)] = (Transmog.otherPrefixes[tostring(arg1)] or 0) + 1
+			end
 			if TransmogFrame_Find(arg1, Transmog.prefix, 1, true) then
+
+				Transmog.stats.addonOurs = Transmog.stats.addonOurs + 1
+				if string.find(arg2, "AvailableTransmogs", 1, true) then
+					Transmog.stats.avail = Transmog.stats.avail + 1
+					if string.find(arg2, ":start", 1, true) then Transmog.stats.availStart = Transmog.stats.availStart + 1 end
+					if string.find(arg2, ":end", 1, true) then Transmog.stats.availEnd = Transmog.stats.availEnd + 1 end
+				elseif string.find(arg2, "TransmogStatus", 1, true) then
+					Transmog.stats.status = Transmog.stats.status + 1
+				end
+				if not string.find(arg2, "AvailableTransmogs", 1, true) or Transmog.stats.avail <= 6 then
+					Transmog_Log("RECV " .. string.sub(arg2, 1, 90))
+				end
 
 				twfdebug("CHAT_MSG_ADDON " .. arg2)
 				
@@ -436,6 +462,7 @@ Transmog:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
 						end
 						Transmog.transmogDataFromServer[slot][itemClass] = {}
 					elseif TransmogFrame_Find(ex[5], "end", 1, true) then
+						Transmog.availableLoaded = true
 						Transmog:prepareAvailableTransmogs(slot, itemClass)
 					else
 						for i, itemID in pairs(ex) do
@@ -493,6 +520,7 @@ Transmog:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
 							end
 						end
 
+						Transmog.statusReceived = true
 						Transmog:transmogStatus()
 					end
 					return
@@ -558,6 +586,80 @@ Transmog:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
     end
 end)
 
+do
+    local origOnEvent = Transmog:GetScript("OnEvent")
+    Transmog:SetScript("OnEvent", function(self, event, ...)
+        if event == "ADDON_ACTION_BLOCKED" then
+            local addon, func = ...
+            if addon == "Transmog" and not Transmog.hwMode then
+                Transmog.hwMode = true
+                if Transmog.lastPopped then
+                    table.insert(Transmog.sendQueue, 1, Transmog.lastPopped)
+                    Transmog.lastPopped = nil
+                end
+                Transmog_Log("BLOCKED " .. tostring(func) .. " -> hardware mode")
+                DEFAULT_CHAT_FRAME:AddMessage("|cffff5555[Transmog]|r the client blocked an automatic chat command. Click anywhere in the Transmog window (or on a slot) to load your data.")
+            end
+            return
+        end
+        if event == "CHAT_MSG_SYSTEM" then
+            local msg = ...
+            Transmog_Log("SYS " .. string.sub(tostring(msg), 1, 100))
+            return
+        end
+        local ok, err = pcall(origOnEvent, self, event, ...)
+        if not ok then
+            Transmog.stats.errors = Transmog.stats.errors + 1
+            Transmog.lastError = tostring(err)
+            Transmog_Log("ERR " .. string.sub(tostring(err), 1, 140))
+            if Transmog.stats.errors <= 3 then
+                DEFAULT_CHAT_FRAME:AddMessage("|cffff5555[Transmog] error: " .. tostring(err))
+            end
+        end
+    end)
+    Transmog:RegisterEvent("CHAT_MSG_SYSTEM")
+    Transmog:RegisterEvent("ADDON_ACTION_BLOCKED")
+end
+
+SLASH_TMCHAT1 = "/tmchat"
+SlashCmdList["TMCHAT"] = function(msg)
+    msg = string.upper(msg or "")
+    if msg == "SAY" or msg == "EMOTE" or msg == "PARTY" or msg == "GUILD" or msg == "YELL" then
+        Transmog.chatType = msg
+        Transmog.hwMode = false
+        DEFAULT_CHAT_FRAME:AddMessage("|cff69ccf0[Transmog]|r commands are now sent via " .. msg)
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("|cff69ccf0[Transmog]|r usage: /tmchat SAY|EMOTE|PARTY|GUILD|YELL   (current: " .. Transmog.chatType .. (Transmog.hwMode and ", hardware mode" or "") .. ")")
+    end
+end
+
+SLASH_TMDIAG1 = "/tmdiag"
+SlashCmdList["TMDIAG"] = function(msg)
+    local function p(s) DEFAULT_CHAT_FRAME:AddMessage("|cff69ccf0[tmdiag]|r " .. s) end
+    if msg == "req" then
+        Transmog.availableLoaded = false
+        Transmog:aSend("GetAvailableTransmogs")
+        p("queued GetAvailableTransmogs")
+        return
+    end
+    local s = Transmog.stats
+    local cats, items = 0, 0
+    for slot, t in pairs(Transmog.transmogDataFromServer) do
+        for cls, ids in pairs(t) do
+            cats = cats + 1
+            items = items + #ids
+        end
+    end
+    p(string.format("sent=%d  ours=%d (avail=%d start=%d end=%d status=%d)  otherPrefix=%d  errors=%d",
+        s.sent, s.addonOurs, s.avail, s.availStart, s.availEnd, s.status, s.addonOther, s.errors))
+    p(string.format("stored categories=%d items=%d  availableLoaded=%s statusReceived=%s queue=%d chat=%s hwMode=%s",
+        cats, items, tostring(Transmog.availableLoaded), tostring(Transmog.statusReceived), #Transmog.sendQueue, Transmog.chatType, tostring(Transmog.hwMode)))
+    for k, v in pairs(Transmog.otherPrefixes) do p("other prefix: " .. k .. " x" .. v) end
+    if Transmog.lastError then p("last error: " .. Transmog.lastError) end
+    p("--- last log entries ---")
+    for i = math.max(1, #Transmog.log - 24), #Transmog.log do p(Transmog.log[i]) end
+end
+
 function Transmog:EquippedItemsChanged()
     for _, InventorySlotId in pairs(self.inventorySlots) do
         if GetInventoryItemLink('player', InventorySlotId) then
@@ -597,6 +699,33 @@ end
 function Transmog_OnLoad()
 
 	twfdebug("Transmog_OnLoad start")
+
+    -- In 1.14 the DressUpModel sits above sibling buttons and eats their clicks.
+    -- Keep the preview model below every slot button.
+    local baseLevel = TransmogFrame:GetFrameLevel()
+    TransmogFramePlayerModel:SetFrameLevel(baseLevel + 1)
+    for slotName in pairs(Transmog.inventorySlots) do
+        local slotFrame = getglobal(slotName)
+        if slotFrame then
+            slotFrame:SetFrameLevel(baseLevel + 10)
+            local autocast = getglobal(slotName .. 'AutoCast')
+            if autocast then
+                autocast:SetFrameLevel(baseLevel + 11)
+            end
+        end
+    end
+    TransmogFrameRevert:SetFrameLevel(baseLevel + 10)
+
+    -- real clicks flush queued commands when the client blocked automatic sends
+    TransmogFrame:EnableMouse(true)
+    TransmogFrame:HookScript("OnMouseDown", Transmog_FlushHW)
+    for slotName in pairs(Transmog.inventorySlots) do
+        local slotFrame = getglobal(slotName)
+        if slotFrame then
+            slotFrame:HookScript("OnClick", Transmog_FlushHW)
+        end
+    end
+    TransmogFrameRevert:HookScript("OnClick", Transmog_FlushHW)
 
     Transmog:cacheItem(51217)
 
@@ -659,6 +788,28 @@ function Transmog:LoadOnce()
     --self:aSend("GetSetsStatus:")
 end
 
+-- The addon is loaded before the character is in the world, so the requests sent from
+-- LoadOnce can be dropped by the 1.14 client. Request again (a few times) whenever the
+-- window opens until the server has actually answered.
+function Transmog_EnsureData()
+    if not TransmogFrame:IsVisible() then
+        return
+    end
+    local missing = false
+    if not Transmog.statusReceived then
+        Transmog:aSend("GetTransmogStatus")
+        missing = true
+    end
+    if not Transmog.availableLoaded then
+        Transmog:aSend("GetAvailableTransmogs")
+        missing = true
+    end
+    if missing and (Transmog.loadTries or 0) < 6 then
+        Transmog.loadTries = (Transmog.loadTries or 0) + 1
+        C_Timer.After(1.5, Transmog_EnsureData)
+    end
+end
+
 function TransmogFrame_OnShow()
 
 	twfdebug("TransmogFrame_OnShow start")
@@ -670,6 +821,15 @@ function TransmogFrame_OnShow()
     Transmog:Reset()
 	
 	Transmog:hideItems(false)
+
+    UIDropDownMenu_SetText(TransmogFrameOutfits, "Outfits")
+
+    -- Paint the equipped gear straight away from local data, instead of waiting for
+    -- the server's TransmogStatus reply (the first request can get lost on a fresh open).
+    Transmog:transmogStatus()
+    Transmog.statusReceived = false
+    Transmog.loadTries = 0
+    Transmog_EnsureData()
 
     TransmogFramePlayerModel:EnableMouseWheel(true)
     TransmogFramePlayerModel:SetScript('OnMouseUp', function(self)
@@ -744,6 +904,7 @@ function Transmog:Reset(once)
 	TransmogFrameCurrencyText:Hide()
 	TransmogFrameCurrencyIcon:Hide()
 
+    TransmogFramePlayerModel.tmogPending = nil
     TransmogFramePlayerModel:SetUnit("player")
 
     Transmog_switchTab(self.tab)
@@ -751,13 +912,71 @@ function Transmog:Reset(once)
 
 end
 
+-- Diagnostics ---------------------------------------------------------
+Transmog.log = {}
+Transmog.stats = { addonOurs = 0, addonOther = 0, avail = 0, availStart = 0, availEnd = 0, status = 0, sent = 0, errors = 0 }
+Transmog.otherPrefixes = {}
+
+function Transmog_Log(s)
+    table.insert(Transmog.log, string.format("%.1f %s", GetTime() % 1000, s))
+    if #Transmog.log > 60 then
+        table.remove(Transmog.log, 1)
+    end
+end
+
+-- Sending chat commands in 1.14:
+-- SendChatMessage to SAY/YELL/CHANNEL is blocked unless it runs inside a hardware event
+-- (mouse click / key press); from timers or events it raises ADDON_ACTION_BLOCKED. So:
+--   * background sends use EMOTE (not covered by that restriction; the server still parses
+--     "." commands in it). Change with  /tmchat <SAY|EMOTE|PARTY|GUILD|YELL>
+--   * if the client reports a block anyway, requests wait in the queue and are sent from
+--     the next click inside the Transmog window ("hardware mode").
+Transmog.chatType = "EMOTE"
+Transmog.hwMode = false
+Transmog.sendQueue = {}
+Transmog.sendFrame = CreateFrame("Frame")
+Transmog.sendFrame.last = 0
+
+local function Transmog_RawSend(data, chatType)
+    SendChatMessage("." .. Transmog.prefix .. " " .. data, chatType)
+    Transmog.stats.sent = Transmog.stats.sent + 1
+    Transmog_Log("SENT(" .. chatType .. ") " .. data)
+end
+
+Transmog.sendFrame:SetScript("OnUpdate", function(self)
+    if Transmog.hwMode then
+        return
+    end
+    if #Transmog.sendQueue > 0 and GetTime() - self.last >= 0.4 then
+        local data = table.remove(Transmog.sendQueue, 1)
+        self.last = GetTime()
+        Transmog.lastPopped = data
+        Transmog_RawSend(data, Transmog.chatType)
+    end
+end)
+
+-- called from real clicks: flush anything waiting
+function Transmog_FlushHW()
+    if not Transmog.hwMode then
+        return
+    end
+    while #Transmog.sendQueue > 0 do
+        Transmog_RawSend(table.remove(Transmog.sendQueue, 1), "SAY")
+    end
+end
+
 function Transmog:aSend(data)
     if self.localCache[data] then
         twfdebug("|cff69ccf0 not send " .. data .. " data cached")
-    else
-		SendChatMessage("." .. self.prefix .. " " .. data, "SAY")
-        twfdebug("|cff69ccf0 send -> " .. data)
+        return
     end
+    for _, q in ipairs(self.sendQueue) do
+        if q == data then
+            return -- already waiting
+        end
+    end
+    table.insert(self.sendQueue, data)
+    twfdebug("|cff69ccf0 queued -> " .. data)
 end
 
 function Transmog:setProgressBar(collected, possible)
@@ -793,12 +1012,50 @@ Transmog.availableTransmogsCacheDelay:SetScript("OnUpdate", function(self)
     if gt >= st then
 
         twfdebug("delay cache: " .. Transmog.availableTransmogsCacheDelay.InventorySlotId)
-        Transmog:prepareAvailableTransmogs(Transmog.availableTransmogsCacheDelay.InventorySlotId, Transmog.availableTransmogsCacheDelay.ItemClass)
+        -- Hide FIRST: prepareAvailableTransmogs may Show() this frame again to schedule
+        -- another retry. Hiding afterwards (as the 1.12 code did) cancelled every retry.
         Transmog.availableTransmogsCacheDelay:Hide()
+        Transmog:prepareAvailableTransmogs(Transmog.availableTransmogsCacheDelay.InventorySlotId, Transmog.availableTransmogsCacheDelay.ItemClass, true)
     end
 end)
 
-function Transmog:prepareAvailableTransmogs(slot, itemClass)
+
+-- ===================================================================
+-- Item preview tiles (1.14)
+-- The 1.12 SetPosition()/frame-scale tricks do not translate to the 1.14 model
+-- camera, so tiles show the full character with only the previewed item(s) on.
+-- Tune with:  /tmcam <x> <y> <z>   (offsets applied to every tile)   /tmcam zoom <0-1>
+-- ===================================================================
+Transmog.tileOffset = { x = 0, y = 0, z = 0 }
+Transmog.tileZoom = 0   -- portrait zoom, 0 = full body
+
+local function Transmog_ApplyTile(model)
+    if not model.tmogItems then return end
+    model:Undress()
+    for _, id in ipairs(model.tmogItems) do
+        Transmog_TryOn(model, id)
+    end
+end
+
+function Transmog_DressTile(model, items, facing)
+    model.tmogItems = items
+    model:SetUnit("player")
+    if model.SetPortraitZoom then
+        model:SetPortraitZoom(Transmog.tileZoom)
+    end
+    local o = Transmog.tileOffset
+    model:SetPosition(o.x, o.y, o.z)
+    if model.SetFacing then
+        model:SetFacing(facing or 0.61)
+    elseif model.SetRotation then
+        model:SetRotation(facing or 0.61)
+    end
+    Transmog_ApplyTile(model)
+    -- models load asynchronously in 1.14: dress again once the model is ready
+    pcall(model.SetScript, model, "OnModelLoaded", Transmog_ApplyTile)
+end
+
+function Transmog:prepareAvailableTransmogs(slot, itemClass, isRetry)
 
 	twfdebug("prepareAvailableTransmogs start slot: " .. slot .. " itemClass: " .. itemClass)
 
@@ -806,36 +1063,33 @@ function Transmog:prepareAvailableTransmogs(slot, itemClass)
 		Transmog.availableTransmogItems[slot] = {}
 	end
 
-    self.availableTransmogItems[slot][itemClass] = {}
+    if not isRetry then
+        self.cacheRetries = 0
+    end
+
+    local list = {}
+    local missing = false
+
+    local eqItemLink = nil
+    local inventoryItemLink = GetInventoryItemLink('player', slot)
+    if inventoryItemLink then
+        eqItemLink = Transmog_ItemString(inventoryItemLink)
+    end
 
     for i, itemID in pairs(self.transmogDataFromServer[slot][itemClass]) do
         itemID = TransmogFrame_ToNumber(itemID)
         local name, link, quality, _, xt1, xt2, _, equip_slot, xtex = Transmog_GetItemInfo(itemID)
-		--local itemName, a1, a2, a3, itemClass, itemSubclass, a6, invType = Transmog_GetItemInfo(eqItemLink)
-		
-		-- This will fail if the item is not currently equipped
-		local eqItemLink = nil
-		local inventoryItemLink = GetInventoryItemLink('player', slot)
-		if inventoryItemLink then
-			local eqItemLink2 = Transmog_ItemString(inventoryItemLink)
-			eqItemLink = eqItemLink2;
-		end
 
         if not name then
-            self:cacheItem(itemID);
-            twfdebug("caching item " .. itemID)
-            Transmog.availableTransmogsCacheDelay.InventorySlotId = slot
-			Transmog.availableTransmogsCacheDelay.ItemClass = itemClass
-            Transmog.availableTransmogsCacheDelay:Show()
-            return
-        end
-
-        if name then
-			local reset = false
-			if eqItemLink then
-				reset = itemID == self:IDFromLink(eqItemLink)
-			end
-            table.insert(self.availableTransmogItems[slot][itemClass], {
+            -- 1.14 loads item data asynchronously: request every missing item now, retry shortly
+            self:cacheItem(itemID)
+            missing = true
+        else
+            local reset = false
+            if eqItemLink then
+                reset = itemID == self:IDFromLink(eqItemLink)
+            end
+            table.insert(list, {
                 ['id'] = itemID,
                 ['reset'] = reset,
                 ['name'] = name,
@@ -849,7 +1103,20 @@ function Transmog:prepareAvailableTransmogs(slot, itemClass)
             })
         end
     end
-	
+
+    self.availableTransmogItems[slot][itemClass] = list
+
+    if missing and (self.cacheRetries or 0) < 40 then
+        self.cacheRetries = (self.cacheRetries or 0) + 1
+        Transmog.availableTransmogsCacheDelay.InventorySlotId = slot
+        Transmog.availableTransmogsCacheDelay.ItemClass = itemClass
+        Transmog.availableTransmogsCacheDelay:Show()
+    elseif TransmogFrame:IsVisible() and Transmog.tab == 'items'
+            and Transmog.currentTransmogSlot == slot and Transmog.currentTransmogItemClass == itemClass then
+        -- the slot the player is looking at just became ready: draw it
+        self:renderAvailableTransmogs(slot, itemClass)
+    end
+
 	twfdebug("prepareAvailableTransmogs end")
 end
 
@@ -861,9 +1128,16 @@ function Transmog:renderAvailableTransmogs(slot, itemClass)
     self:hideItems(true)
     self:hideItemBorders()
 	
-	if not self.transmogDataFromServer[slot] then
+	if not self.transmogDataFromServer[slot] or not self.transmogDataFromServer[slot][itemClass] then
+		TransmogFrameNoTransmogs:Show()
 		return
 	end
+
+    if not self.availableTransmogItems[slot] or not self.availableTransmogItems[slot][itemClass] then
+        -- items not prepared yet (e.g. item data still loading): prepare, which re-renders when ready
+        self:prepareAvailableTransmogs(slot, itemClass)
+        return
+    end
 
     self:setProgressBar(self:tableSize(self.transmogDataFromServer[slot][itemClass]), self.numTransmogs[slot][itemClass])
     if self:tableSize(self.transmogDataFromServer[slot][itemClass]) == 0 then
@@ -909,219 +1183,18 @@ function Transmog:renderAvailableTransmogs(slot, itemClass)
 
             local model = getglobal('TransmogLook' .. itemIndex .. 'ItemModel')
 
-            model:SetUnit("player")
-            model:SetRotation(0.61);
-            local Z, X, Y = model:GetPosition(Z, X, Y)
-
-            if self.race == 'nightelf' then
-                Z = Z + 3
-            end
-            if self.race == 'gnome' then
-                Z = Z - 3
-                Y = Y + 1.5
-            end
-            if self.race == 'dwarf' then
-                Y = Y + 1
-                Z = Z - 1
-            end
-            if self.race == 'troll' then
-                Z = Z + 2
-            end
-            if self.race == 'goblin' then
-                Z = Z - 0.5
-            end
-
-            -- head
-            if self.currentTransmogSlot == self.inventorySlots['HeadSlot'] then
-                if self.race == 'tauren' then
-                    model:SetRotation(0.3);
-                    X = X - 0.2
-                    Y = Y + 0.2
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                end
-                if self.race == 'dwarf' then
-                    Y = Y + 0.5
-                end
-                model:SetPosition(Z + 5.8, X, Y - 2.2)
-            end
-
-            -- shoulder
-            if self.currentTransmogSlot == self.inventorySlots['ShoulderSlot'] then
-                if self.race == 'dwarf' then
-                    Y = Y - 0.2
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                    Z = Z - 0.5
-                end
-                if self.race == 'nightelf' then
-                    Z = Z - 1
-                end
-                model:SetPosition(Z + 5.8, X + 0.5, Y - 1.7)
-            end
-
-            -- cloak
+            local facing = 0.61
             if self.currentTransmogSlot == self.inventorySlots['BackSlot'] then
-                model:SetRotation(3.2);
-                model:SetPosition(Z + 3.8, X, Y - 0.7)
+                facing = 3.2
+            elseif self.currentTransmogSlot == self.inventorySlots['SecondaryHandSlot'] then
+                facing = -0.61
             end
-
-            -- chest
-            if self.currentTransmogSlot == self.inventorySlots['ChestSlot'] then
-                if self.race == 'tauren' then
-                    model:SetRotation(0.3);
-                    X = X - 0.2
-                    Y = Y + 0.5
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                    Z = Z - 0.5
-                end
-                model:SetRotation(0.61);
-                model:SetPosition(Z + 5.8, X + 0.1, Y - 1.2)
-            end
-
-            -- bracer
-            if self.currentTransmogSlot == self.inventorySlots['WristSlot'] then
-                model:SetRotation(1.5);
-                if self.race == 'gnome' then
-                    Y = Y - 1
-                end
-                if self.race == 'tauren' then
-                    X = X - 0.2
-                end
-                if self.race == 'dwarf' then
-                    X = X - 0.3
-                    Y = Y - 0.4
-                end
-                if self.race == 'troll' then
-                    Y = Y + 0.6
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                    Z = Z - 0.5
-                end
-                model:SetPosition(Z + 5.8, X + 0.4, Y - 0.3)
-            end
-
-            -- hands
-            if self.currentTransmogSlot == self.inventorySlots['HandsSlot'] then
-                model:SetRotation(1.5);
-                if self.race == 'gnome' then
-                    Y = Y - 0.7
-                end
-                if self.race == 'tauren' then
-                    X = X - 0.2
-                end
-                if self.race == 'dwarf' then
-                    Z = Z - 0.2
-                    X = X - 0.3
-                    Y = Y - 0.1
-                end
-                if self.race == 'troll' then
-                    Y = Y + 0.9
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                    Z = Z - 0.5
-                end
-                model:SetPosition(Z + 5.8, X + 0.4, Y - 0.3)
-            end
-
-            -- belt
-            if self.currentTransmogSlot == self.inventorySlots['WaistSlot'] then
-                model:SetRotation(0.31);
-                if self.race == 'gnome' then
-                    Y = Y - 0.7
-                end
-                if self.race == 'tauren' then
-                    Z = Z + 1
-                    Y = Y + 0.3
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1.5
-                    Z = Z - 0.5
-                end
-                model:SetPosition(Z + 5.8, X, Y - 0.4)
-            end
-
-            -- pants
-            if self.currentTransmogSlot == self.inventorySlots['LegsSlot'] then
-                model:SetRotation(0.31);
-                if self.race == 'gnome' then
-                    Z = Z + 2
-                    Y = Y - 1.5
-                end
-                if self.race == 'dwarf' then
-                    Y = Y - 0.9
-                end
-                model:SetPosition(Z + 3.8, X, Y + 0.9)
-            end
-
-            -- boots
-            if self.currentTransmogSlot == self.inventorySlots['FeetSlot'] then
-                model:SetRotation(0.61);
-                if self.race == 'gnome' then
-                    Z = Z + 2
-                    Y = Y - 1.9
-                end
-                if self.race == 'dwarf' then
-                    Y = Y - 0.6
-                end
-                model:SetPosition(Z + 4.8, X, Y + 1.5)
-            end
-
-            -- mh
-            if self.currentTransmogSlot == self.inventorySlots['MainHandSlot'] then
-                model:SetRotation(0.61);
-                if self.race == 'gnome' then
-                    Y = Y - 2
-                end
-                if self.race == 'dwarf' then
-                    Y = Y - 1
-                end
-                model:SetPosition(Z + 3.8, X, Y + 0.4)
-            end
-
-            -- oh
-            if self.currentTransmogSlot == self.inventorySlots['SecondaryHandSlot'] then
-                model:SetRotation(-0.61);
-                model:SetPosition(Z + 3.8, X, Y)
-                if self.race == 'gnome' then
-                    Y = Y - 1.5
-                end
-                if self.race == 'dwarf' then
-                    Y = Y - 1
-                end
-            end
-
-            -- ranged
-            if self.currentTransmogSlot == self.inventorySlots['RangedSlot'] then
-                model:SetRotation(-0.61)
-                if self.invTypes[item.equip_slot] == C_INVTYPE_RANGEDRIGHT then
-                    model:SetRotation(0.61);
-                end
-                if self.race == 'troll' then
-                    Y = Y + 1.5
-                end
-                if self.race == 'goblin' then
-                    Y = Y + 1
-                end
-                if self.race == 'gnome' then
-                    Y = Y - 1.5
-                end
-                model:SetPosition(Z + 3.8, X, Y)
-            end
-
-            model:Undress()
 
             if self.currentTransmogSlot == self.inventorySlots['SecondaryHandSlot'] then
                 Transmog_TryOn(TransmogFramePlayerModel, self.equippedItems[self.inventorySlots['MainHandSlot']])
             end
 
-            Transmog_TryOn(model, item.id);
+            Transmog_DressTile(model, { item.id }, facing)
 
             col = col + 1
             if col == 5 then
@@ -2082,17 +2155,7 @@ function Transmog_switchTab(to)
                 Transmog.ItemButtons[setIndex]:Show()
 
                 local model = getglobal('TransmogLook' .. setIndex .. 'ItemModel')
-
-                model:SetUnit("player")
-                model:SetRotation(0.61);
-                local Z, X, Y = model:GetPosition(Z, X, Y)
-
-                model:SetPosition(Z + 1.5, X, Y)
-
-                model:Undress()
-                for _, itemID in pairs(set.items) do
-                    Transmog_TryOn(model, itemID)
-                end
+                Transmog_DressTile(model, set.items, 0.61)
 
                 col = col + 1
                 if col == 5 then
@@ -2621,6 +2684,24 @@ function OutfitsDropDown_Initialize()
 
 end
 
+-- try several items on the big preview model; models load asynchronously in 1.14,
+-- so also (re)apply them once the model reports it has finished loading
+function Transmog_TryOnList(model, items)
+    model.tmogPending = items
+    for _, id in ipairs(items) do
+        Transmog_TryOn(model, id)
+    end
+    pcall(model.SetScript, model, "OnModelLoaded", function(m)
+        local pending = m.tmogPending
+        m.tmogPending = nil
+        if pending then
+            for _, id in ipairs(pending) do
+                Transmog_TryOn(m, id)
+            end
+        end
+    end)
+end
+
 function Transmog_LoadOutfit(self, outfit)
     UIDropDownMenu_SetText(TransmogFrameOutfits, outfit)
 
@@ -2632,67 +2713,60 @@ function Transmog_LoadOutfit(self, outfit)
 
     Transmog:hideItemBorders()
 
+    -- Start from what the server currently has applied. Without this, slots that are not part of
+    -- the outfit kept the changes staged by the previously loaded outfit.
+    for slot in pairs(Transmog.transmogStatusToServer) do
+        Transmog.transmogStatusToServer[slot] = Transmog.transmogStatusFromServer[slot] or 0
+    end
+    TransmogFramePlayerModel:SetUnit("player")
+    Transmog:transmogStatus() -- repaints icons / borders from the server state
+
+    local tryItems = {}
+
     for slot, itemID in pairs(transmogOutfits[outfit]) do
 
-        local eq_slot, tex
-        local hasItemEquipped = false
+        if itemID ~= 0 and GetInventoryItemLink('player', slot) then
 
-        if GetInventoryItemLink('player', slot) then
-            hasItemEquipped = true
-        end
-
-        if hasItemEquipped then
-
-            if itemID == 0 then
-                local eqItemLink = Transmog_ItemString(GetInventoryItemLink('player', slot))
-                local _, _, _, _, _, _, _, equip_slot, outfitTex = Transmog_GetItemInfo(eqItemLink)
-                eq_slot = equip_slot
-                tex = outfitTex
-            else
-                local _, _, _, _, _, _, _, equip_slot, outfitTex = Transmog_GetItemInfo(itemID)
-                eq_slot = equip_slot
-                tex = outfitTex
-            end
-
+            -- slot frame by inventory slot id (works for rings/trinkets and uncached items)
             local frame
-
-            frame = Transmog:frameFromInvType(eq_slot)
-
-            if hasItemEquipped then
-                Transmog_TryOn(TransmogFramePlayerModel, itemID)
+            for slotName, slotId in pairs(Transmog.inventorySlots) do
+                if slotId == slot then
+                    frame = getglobal(slotName)
+                    break
+                end
             end
+
+            local _, _, _, _, _, _, _, _, tex = Transmog_GetItemInfo(itemID)
+            if not tex then
+                Transmog:cacheItem(itemID)
+                tex = GetItemIcon and GetItemIcon(itemID)
+            end
+
+            table.insert(tryItems, itemID)
 
             if frame then
+                if tex then
+                    getglobal(frame:GetName() .. "ItemIcon"):SetTexture(tex)
+                end
 
-                getglobal(frame:GetName() .. "ItemIcon"):SetTexture(tex)
-
-                if Transmog.transmogStatusToServer[slot] ~= itemID then
+                if Transmog.transmogStatusFromServer[slot] ~= itemID then
                     getglobal(frame:GetName() .. 'BorderHi'):Show()
                     getglobal(frame:GetName() .. 'AutoCast'):Show()
                 end
-
-                if itemID == 0 or not hasItemEquipped then
-                    getglobal(frame:GetName() .. 'BorderHi'):Hide()
-                    getglobal(frame:GetName() .. 'AutoCast'):Hide()
-                end
-
             end
 
             Transmog.transmogStatusToServer[slot] = itemID
-
         end
 
     end
+
+    Transmog_TryOnList(TransmogFramePlayerModel, tryItems)
+
     Transmog:calculateCost()
 end
 
 function Transmog_SaveOutfit()
 	transmogOutfits[Transmog.currentOutfit] = {}
-    for InventorySlotId, itemID in pairs(Transmog.transmogStatusFromServer) do
-        if itemID ~= 0 then
-            transmogOutfits[Transmog.currentOutfit][InventorySlotId] = itemID
-        end
-    end
     for InventorySlotId, itemID in pairs(Transmog.transmogStatusToServer) do
         if itemID ~= 0 then
             transmogOutfits[Transmog.currentOutfit][InventorySlotId] = itemID
@@ -2817,6 +2891,29 @@ SlashCmdList["TRANSMOGDEBUG"] = function(cmd)
         else
             Transmog.debug = true
             twfprint("Transmog debug on")
+        end
+    end
+end
+
+SLASH_TMCAM1 = "/tmcam"
+SlashCmdList["TMCAM"] = function(msg)
+    local a, b, c = string.match(msg or "", "^(%S+)%s*(%S*)%s*(%S*)")
+    if a == "zoom" then
+        Transmog.tileZoom = tonumber(b) or 0
+    elseif a then
+        Transmog.tileOffset.x = tonumber(a) or 0
+        Transmog.tileOffset.y = tonumber(b) or 0
+        Transmog.tileOffset.z = tonumber(c) or 0
+    else
+        Transmog.tileOffset.x, Transmog.tileOffset.y, Transmog.tileOffset.z = 0, 0, 0
+        Transmog.tileZoom = 0
+    end
+    twfprint(string.format("tile camera: x=%s y=%s z=%s zoom=%s", Transmog.tileOffset.x, Transmog.tileOffset.y, Transmog.tileOffset.z, Transmog.tileZoom))
+    if TransmogFrame:IsVisible() then
+        if Transmog.tab == 'items' and Transmog.currentTransmogSlot then
+            Transmog:renderAvailableTransmogs(Transmog.currentTransmogSlot, Transmog.currentTransmogItemClass)
+        else
+            Transmog_switchTab(Transmog.tab)
         end
     end
 end
