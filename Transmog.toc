@@ -1,0 +1,7 @@
+## Interface: 11402
+## Title: Transmog
+## Notes: Transmog UI for CMangos WoW (ported to Classic Era 1.14.2)
+## SavedVariablesPerCharacter: transmogOutfits
+Transmog.lua
+Transmog.xml
+TransmogSets.lua
